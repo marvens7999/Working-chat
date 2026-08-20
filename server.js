@@ -8,6 +8,8 @@ const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT) || 10000;
 
+const ADMIN_USER_ID = "10909271675";
+
 const wss = new WebSocketServer({
     server,
     path: "/chat"
@@ -18,7 +20,7 @@ const rooms = new Map();
 function createRoom(roomId) {
     const room = {
         clients: new Set(),
-        bannedPlayerIds: new Set(), // Tracks banned user IDs per room
+        bannedPlayerIds: new Set(),
         createdAt: Date.now()
     };
 
@@ -53,9 +55,18 @@ function broadcastPresence(roomId) {
     const room = rooms.get(roomId);
     if (!room) return;
 
+    // Count unique Roblox player IDs instead of WebSocket connections
+    const uniquePlayers = new Set();
+
+    for (const client of room.clients) {
+        if (client.playerId) {
+            uniquePlayers.add(client.playerId);
+        }
+    }
+
     broadcast(roomId, {
         type: "presence",
-        online: room.clients.size
+        online: uniquePlayers.size
     });
 }
 
@@ -130,6 +141,14 @@ wss.on("connection", (ws) => {
                 return;
             }
 
+            if (!playerId) {
+                send(ws, {
+                    type: "error",
+                    message: "Invalid player ID."
+                });
+                return;
+            }
+
             const room = getRoom(roomId);
 
             // Check if this player is banned in this room
@@ -143,16 +162,45 @@ wss.on("connection", (ws) => {
 
             removeClientFromRoom(ws);
 
+            /*
+             * If this same Roblox player already has another connection
+             * in this room, close the older connection.
+             *
+             * This prevents the same player from appearing twice online.
+             */
+            for (const existingClient of room.clients) {
+                if (
+                    existingClient !== ws &&
+                    existingClient.playerId === playerId
+                ) {
+                    try {
+                        existingClient.close();
+                    } catch {}
+
+                    room.clients.delete(existingClient);
+                }
+            }
+
             ws.roomId = roomId;
             ws.playerId = playerId;
-            ws.displayName = String(data.displayName || "Player").slice(0, 100);
+            ws.displayName = String(
+                data.displayName || "Player"
+            ).slice(0, 100);
 
             room.clients.add(ws);
+
+            const uniquePlayers = new Set();
+
+            for (const client of room.clients) {
+                if (client.playerId) {
+                    uniquePlayers.add(client.playerId);
+                }
+            }
 
             send(ws, {
                 type: "joined",
                 roomId: roomId,
-                online: room.clients.size
+                online: uniquePlayers.size
             });
 
             broadcastPresence(roomId);
@@ -160,6 +208,7 @@ wss.on("connection", (ws) => {
         }
 
         if (!ws.roomId) return;
+
         const room = rooms.get(ws.roomId);
         if (!room) return;
 
@@ -184,23 +233,42 @@ wss.on("connection", (ws) => {
         }
 
         if (data.type === "admin_command") {
-            const commandString = String(data.commandString || "").trim();
+
+            // Server-side admin verification
+            if (String(ws.playerId) !== ADMIN_USER_ID) {
+                send(ws, {
+                    type: "error",
+                    message: "Unauthorized admin command."
+                });
+                return;
+            }
+
+            const commandString = String(
+                data.commandString || ""
+            ).trim();
+
             if (!commandString) return;
 
             // Check if command is a ban command: e.g. ";ban username"
             if (commandString.toLowerCase().startsWith(";ban ")) {
-                const targetName = commandString.slice(5).trim().toLowerCase();
-                
+                const targetName = commandString
+                    .slice(5)
+                    .trim()
+                    .toLowerCase();
+
                 // Find client matching target display name or user ID
                 for (const client of room.clients) {
-                    if (client.displayName.toLowerCase() === targetName || client.playerId === targetName) {
+                    if (
+                        client.displayName.toLowerCase() === targetName ||
+                        client.playerId === targetName
+                    ) {
                         room.bannedPlayerIds.add(client.playerId);
                         break;
                     }
                 }
             }
 
-            // Broadcast command sync to all clients in the room so everyone's scripts render the HL/title/ban
+            // Broadcast command sync to all clients
             broadcast(ws.roomId, {
                 type: "admin_sync",
                 commandString: commandString.slice(0, 300),
@@ -234,7 +302,9 @@ const heartbeatInterval = setInterval(() => {
             ws.terminate();
             continue;
         }
+
         ws.isAlive = false;
+
         try {
             ws.ping();
         } catch {
@@ -245,9 +315,13 @@ const heartbeatInterval = setInterval(() => {
 
 function shutdown() {
     clearInterval(heartbeatInterval);
+
     for (const ws of wss.clients) {
-        try { ws.close(); } catch {}
+        try {
+            ws.close();
+        } catch {}
     }
+
     server.close(() => {
         process.exit(0);
     });
