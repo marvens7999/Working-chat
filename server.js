@@ -18,6 +18,7 @@ const rooms = new Map();
 function createRoom(roomId) {
     const room = {
         clients: new Set(),
+        bannedPlayerIds: new Set(), // Tracks banned user IDs per room
         createdAt: Date.now()
     };
 
@@ -60,11 +61,9 @@ function broadcastPresence(roomId) {
 
 function removeClientFromRoom(ws) {
     const roomId = ws.roomId;
-
     if (!roomId) return;
 
     const room = rooms.get(roomId);
-
     ws.roomId = null;
 
     if (!room) return;
@@ -121,6 +120,7 @@ wss.on("connection", (ws) => {
 
         if (data.type === "join") {
             const roomId = String(data.roomId || "").trim();
+            const playerId = String(data.playerId || "").slice(0, 100);
 
             if (!roomId || roomId.length > 200) {
                 send(ws, {
@@ -130,15 +130,22 @@ wss.on("connection", (ws) => {
                 return;
             }
 
+            const room = getRoom(roomId);
+
+            // Check if this player is banned in this room
+            if (room.bannedPlayerIds.has(playerId)) {
+                send(ws, {
+                    type: "error",
+                    message: "You are banned from this chat room."
+                });
+                return;
+            }
+
             removeClientFromRoom(ws);
 
             ws.roomId = roomId;
-            ws.playerId = String(data.playerId || "").slice(0, 100);
-            ws.displayName = String(
-                data.displayName || "Player"
-            ).slice(0, 100);
-
-            const room = getRoom(roomId);
+            ws.playerId = playerId;
+            ws.displayName = String(data.displayName || "Player").slice(0, 100);
 
             room.clients.add(ws);
 
@@ -149,27 +156,54 @@ wss.on("connection", (ws) => {
             });
 
             broadcastPresence(roomId);
+            return;
+        }
 
+        if (!ws.roomId) return;
+        const room = rooms.get(ws.roomId);
+        if (!room) return;
+
+        // Verify sender isn't banned
+        if (room.bannedPlayerIds.has(ws.playerId)) {
             return;
         }
 
         if (data.type === "chat") {
-            if (!ws.roomId) return;
-
-            const room = rooms.get(ws.roomId);
-            if (!room) return;
-
             const text = String(data.text || "").trim();
-
             if (!text) return;
-
-            const safeText = text.slice(0, 300);
 
             broadcast(ws.roomId, {
                 type: "chat",
                 playerId: ws.playerId,
                 displayName: ws.displayName,
-                text: safeText,
+                text: text.slice(0, 300),
+                timestamp: Date.now()
+            });
+
+            return;
+        }
+
+        if (data.type === "admin_command") {
+            const commandString = String(data.commandString || "").trim();
+            if (!commandString) return;
+
+            // Check if command is a ban command: e.g. ";ban username"
+            if (commandString.toLowerCase().startsWith(";ban ")) {
+                const targetName = commandString.slice(5).trim().toLowerCase();
+                
+                // Find client matching target display name or user ID
+                for (const client of room.clients) {
+                    if (client.displayName.toLowerCase() === targetName || client.playerId === targetName) {
+                        room.bannedPlayerIds.add(client.playerId);
+                        break;
+                    }
+                }
+            }
+
+            // Broadcast command sync to all clients in the room so everyone's scripts render the HL/title/ban
+            broadcast(ws.roomId, {
+                type: "admin_sync",
+                commandString: commandString.slice(0, 300),
                 timestamp: Date.now()
             });
 
@@ -181,7 +215,6 @@ wss.on("connection", (ws) => {
                 type: "pong",
                 timestamp: Date.now()
             });
-
             return;
         }
     });
@@ -201,9 +234,7 @@ const heartbeatInterval = setInterval(() => {
             ws.terminate();
             continue;
         }
-
         ws.isAlive = false;
-
         try {
             ws.ping();
         } catch {
@@ -214,13 +245,9 @@ const heartbeatInterval = setInterval(() => {
 
 function shutdown() {
     clearInterval(heartbeatInterval);
-
     for (const ws of wss.clients) {
-        try {
-            ws.close();
-        } catch {}
+        try { ws.close(); } catch {}
     }
-
     server.close(() => {
         process.exit(0);
     });
