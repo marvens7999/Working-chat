@@ -14,6 +14,9 @@ const PORT = Number(process.env.PORT) || 10000;
 
 const ADMIN_USER_ID = "10909271675";
 
+const MAX_COMMAND_LENGTH = 300;
+const MAX_ANNOUNCEMENT_LENGTH = 300;
+
 const wss = new WebSocketServer({
     server,
     path: "/chat"
@@ -33,6 +36,7 @@ function createRoom(roomId) {
     };
 
     rooms.set(roomId, room);
+
     return room;
 }
 
@@ -45,7 +49,10 @@ function getRoom(roomId) {
 //==========================================================
 
 function send(ws, payload) {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (
+        ws &&
+        ws.readyState === WebSocket.OPEN
+    ) {
         ws.send(JSON.stringify(payload));
     }
 }
@@ -66,7 +73,6 @@ function broadcast(roomId, payload) {
 
 //==========================================================
 // GLOBAL BROADCAST
-// Sends to EVERY connected client in EVERY room.
 //==========================================================
 
 function broadcastGlobal(payload) {
@@ -138,8 +144,11 @@ function findPlayerInRoom(room, targetName) {
         .trim()
         .toLowerCase();
 
-    if (!targetName) return null;
+    if (!targetName) {
+        return null;
+    }
 
+    // Exact match first
     for (const client of room.clients) {
         const displayName = String(
             client.displayName || ""
@@ -157,7 +166,73 @@ function findPlayerInRoom(room, targetName) {
         }
     }
 
+    // Partial display-name match
+    for (const client of room.clients) {
+        const displayName = String(
+            client.displayName || ""
+        ).toLowerCase();
+
+        if (
+            displayName.startsWith(targetName)
+        ) {
+            return client;
+        }
+    }
+
     return null;
+}
+
+//==========================================================
+// SUPPORTED ADMIN COMMANDS
+//==========================================================
+//
+// These commands are supported by the ZERO system:
+//
+// CLIENT-SIDE EFFECTS VIA admin_sync:
+// ;hl
+// ;unhl
+// ;title
+// ;untitle
+// ;staff
+// ;unstaff
+//
+// SERVER-SIDE:
+// ;ban
+// ;announce
+// ;gannounce
+// ;globalannounce
+//
+//==========================================================
+
+const CLIENT_ADMIN_COMMANDS = new Set([
+    "hl",
+    "unhl",
+    "title",
+    "untitle",
+    "staff",
+    "unstaff"
+]);
+
+const SERVER_ADMIN_COMMANDS = new Set([
+    "ban",
+    "announce",
+    "gannounce",
+    "globalannounce"
+]);
+
+//==========================================================
+// GET COMMAND NAME
+//==========================================================
+
+function getCommandName(commandString) {
+    const firstWord = String(commandString || "")
+        .trim()
+        .split(/\s+/)[0]
+        .toLowerCase();
+
+    return firstWord.startsWith(";")
+        ? firstWord.slice(1)
+        : firstWord;
 }
 
 //==========================================================
@@ -167,7 +242,7 @@ function findPlayerInRoom(room, targetName) {
 app.get("/", (req, res) => {
     res.json({
         status: "online",
-        service: "Roblox Chat Relay",
+        service: "ZERO CHAT Relay",
         rooms: rooms.size,
         connections: wss.clients.size
     });
@@ -209,13 +284,22 @@ wss.on("connection", (ws) => {
         let data;
 
         try {
-            data = JSON.parse(raw.toString());
+            data = JSON.parse(
+                raw.toString()
+            );
         } catch {
             send(ws, {
                 type: "error",
                 message: "Invalid JSON."
             });
 
+            return;
+        }
+
+        if (
+            !data ||
+            typeof data !== "object"
+        ) {
             return;
         }
 
@@ -233,8 +317,10 @@ wss.on("connection", (ws) => {
                 data.playerId || ""
             ).slice(0, 100);
 
-            if (!roomId || roomId.length > 200) {
-
+            if (
+                !roomId ||
+                roomId.length > 200
+            ) {
                 send(ws, {
                     type: "error",
                     message: "Invalid room ID."
@@ -244,7 +330,6 @@ wss.on("connection", (ws) => {
             }
 
             if (!playerId) {
-
                 send(ws, {
                     type: "error",
                     message: "Invalid player ID."
@@ -256,17 +341,21 @@ wss.on("connection", (ws) => {
             const room = getRoom(roomId);
 
             // Check room ban
-            if (room.bannedPlayerIds.has(playerId)) {
-
+            if (
+                room.bannedPlayerIds.has(
+                    playerId
+                )
+            ) {
                 send(ws, {
                     type: "error",
-                    message: "You are banned from this chat room."
+                    message:
+                        "You are banned from this chat room."
                 });
 
                 return;
             }
 
-            // Remove any previous connection
+            // Remove previous room connection
             removeClientFromRoom(ws);
 
             ws.roomId = roomId;
@@ -308,7 +397,11 @@ wss.on("connection", (ws) => {
         // BANNED CHECK
         //==================================================
 
-        if (room.bannedPlayerIds.has(ws.playerId)) {
+        if (
+            room.bannedPlayerIds.has(
+                String(ws.playerId)
+            )
+        ) {
             return;
         }
 
@@ -322,20 +415,16 @@ wss.on("connection", (ws) => {
                 data.text || ""
             ).trim();
 
-            if (!text) return;
+            if (!text) {
+                return;
+            }
 
             broadcast(ws.roomId, {
-
                 type: "chat",
-
                 playerId: ws.playerId,
-
                 displayName: ws.displayName,
-
                 text: text.slice(0, 300),
-
                 timestamp: Date.now()
-
             });
 
             return;
@@ -347,132 +436,194 @@ wss.on("connection", (ws) => {
 
         if (data.type === "admin_command") {
 
-            // Only your account can send admin commands.
+            // Server-side permission check
             if (!isAdmin(ws)) {
 
                 send(ws, {
                     type: "error",
-                    message: "Unauthorized admin command."
+                    message:
+                        "Unauthorized admin command."
                 });
 
                 return;
             }
 
-            const commandString = String(
+            let commandString = String(
                 data.commandString || ""
             ).trim();
 
-            if (!commandString) return;
+            if (!commandString) {
+                return;
+            }
 
-            const lowerCommand =
-                commandString.toLowerCase();
+            commandString =
+                commandString.slice(
+                    0,
+                    MAX_COMMAND_LENGTH
+                );
+
+            if (
+                !commandString.startsWith(";")
+            ) {
+                send(ws, {
+                    type: "error",
+                    message:
+                        "Admin commands must start with ;"
+                });
+
+                return;
+            }
+
+            const commandName =
+                getCommandName(commandString);
 
             //================================================
-            // GLOBAL ANNOUNCEMENT
+            // CLIENT-SIDE COMMANDS
+            //================================================
             //
-            // ;gannounce Hello everyone
-            // ;globalannounce Hello everyone
+            // These are sent to all clients in the
+            // current room. The ZERO CHAT Lua client
+            // executes:
+            //
+            // ;hl
+            // ;unhl
+            // ;title
+            // ;untitle
+            // ;staff
+            // ;unstaff
+            //
             //================================================
 
             if (
-                lowerCommand === ";gannounce" ||
-                lowerCommand.startsWith(";gannounce ") ||
-                lowerCommand === ";globalannounce" ||
-                lowerCommand.startsWith(";globalannounce ")
+                CLIENT_ADMIN_COMMANDS.has(
+                    commandName
+                )
             ) {
 
-                let announcement = "";
-
-                if (
-                    lowerCommand === ";globalannounce" ||
-                    lowerCommand.startsWith(";globalannounce ")
-                ) {
-
-                    announcement = commandString
-                        .slice(15)
-                        .trim();
-
-                } else {
-
-                    announcement = commandString
-                        .slice(10)
-                        .trim();
-                }
-
-                if (!announcement) {
-
-                    send(ws, {
-                        type: "error",
-                        message: "Global announcement text is empty."
-                    });
-
-                    return;
-                }
-
-                const cleanAnnouncement =
-                    announcement.slice(0, 300);
-
-                // Sends to EVERY connected client,
-                // including the admin.
-                broadcastGlobal({
-
-                    type: "global_announcement",
-
-                    playerId: ws.playerId,
-
-                    displayName: ws.displayName,
-
-                    text: cleanAnnouncement,
-
+                broadcast(ws.roomId, {
+                    type: "admin_sync",
+                    commandString:
+                        commandString,
                     timestamp: Date.now()
-
                 });
 
                 return;
             }
 
             //================================================
-            // ROOM ANNOUNCEMENT
-            //
-            // ;announce Hello this server
+            // GLOBAL ANNOUNCEMENT
             //================================================
 
             if (
-                lowerCommand === ";announce" ||
-                lowerCommand.startsWith(";announce ")
+                commandName === "gannounce" ||
+                commandName === "globalannounce"
             ) {
 
-                const announcement = commandString
-                    .slice(9)
-                    .trim();
+                let announcement;
+
+                if (
+                    commandName === "gannounce"
+                ) {
+                    announcement =
+                        commandString
+                            .slice(
+                                ";gannounce".length
+                            )
+                            .trim();
+                } else {
+                    announcement =
+                        commandString
+                            .slice(
+                                ";globalannounce".length
+                            )
+                            .trim();
+                }
 
                 if (!announcement) {
 
                     send(ws, {
                         type: "error",
-                        message: "Announcement text is empty."
+                        message:
+                            "Global announcement text is empty."
+                    });
+
+                    return;
+                }
+
+                announcement =
+                    announcement.slice(
+                        0,
+                        MAX_ANNOUNCEMENT_LENGTH
+                    );
+
+                broadcastGlobal({
+                    type:
+                        "global_announcement",
+
+                    playerId:
+                        ws.playerId,
+
+                    displayName:
+                        ws.displayName,
+
+                    text:
+                        announcement,
+
+                    timestamp:
+                        Date.now()
+                });
+
+                return;
+            }
+
+            //================================================
+            // CURRENT SERVER ANNOUNCEMENT
+            //================================================
+
+            if (
+                commandName === "announce"
+            ) {
+
+                const announcement =
+                    commandString
+                        .slice(
+                            ";announce".length
+                        )
+                        .trim();
+
+                if (!announcement) {
+
+                    send(ws, {
+                        type: "error",
+                        message:
+                            "Announcement text is empty."
                     });
 
                     return;
                 }
 
                 const cleanAnnouncement =
-                    announcement.slice(0, 300);
+                    announcement.slice(
+                        0,
+                        MAX_ANNOUNCEMENT_LENGTH
+                    );
 
-                // Sends to everyone in the current room,
-                // including the admin.
                 broadcast(ws.roomId, {
 
-                    type: "announcement",
+                    type:
+                        "announcement",
 
-                    playerId: ws.playerId,
+                    playerId:
+                        ws.playerId,
 
-                    displayName: ws.displayName,
+                    displayName:
+                        ws.displayName,
 
-                    text: cleanAnnouncement,
+                    text:
+                        cleanAnnouncement,
 
-                    timestamp: Date.now()
-
+                    timestamp:
+                        Date.now()
                 });
 
                 return;
@@ -480,24 +631,23 @@ wss.on("connection", (ws) => {
 
             //================================================
             // BAN
-            //
-            // ;ban PlayerName
             //================================================
 
             if (
-                lowerCommand === ";ban" ||
-                lowerCommand.startsWith(";ban ")
+                commandName === "ban"
             ) {
 
-                const targetName = commandString
-                    .slice(4)
-                    .trim();
+                const targetName =
+                    commandString
+                        .slice(";ban".length)
+                        .trim();
 
                 if (!targetName) {
 
                     send(ws, {
                         type: "error",
-                        message: "Player name is required."
+                        message:
+                            "Player name is required."
                     });
 
                     return;
@@ -513,44 +663,78 @@ wss.on("connection", (ws) => {
 
                     send(ws, {
                         type: "error",
-                        message: "Player not found in this room."
+                        message:
+                            "Player not found in this room."
                     });
 
                     return;
                 }
 
+                // Do not allow the admin to ban
+                // their own account.
+                if (
+                    String(target.playerId) ===
+                    ADMIN_USER_ID
+                ) {
+
+                    send(ws, {
+                        type: "error",
+                        message:
+                            "You cannot ban the admin account."
+                    });
+
+                    return;
+                }
+
+                const targetPlayerId =
+                    String(
+                        target.playerId
+                    );
+
                 room.bannedPlayerIds.add(
-                    String(target.playerId)
+                    targetPlayerId
                 );
 
-                // Sync ban command to clients.
+                // Tell all clients to execute the
+                // client-side ban behavior.
                 broadcast(ws.roomId, {
 
-                    type: "admin_sync",
+                    type:
+                        "admin_sync",
 
                     commandString:
-                        commandString.slice(0, 300),
+                        commandString,
 
-                    timestamp: Date.now()
-
+                    timestamp:
+                        Date.now()
                 });
+
+                // Tell the target directly.
+                send(target, {
+                    type: "error",
+                    message:
+                        "You have been banned from this chat room."
+                });
+
+                // Remove target from this room.
+                try {
+                    target.close(
+                        1008,
+                        "Banned from room"
+                    );
+                } catch {}
 
                 return;
             }
 
             //================================================
-            // OTHER ADMIN COMMANDS
+            // UNKNOWN COMMAND
             //================================================
 
-            broadcast(ws.roomId, {
-
-                type: "admin_sync",
-
-                commandString:
-                    commandString.slice(0, 300),
-
-                timestamp: Date.now()
-
+            send(ws, {
+                type: "error",
+                message:
+                    `Unknown admin command: ;${commandName}`
             });
 
             return;
@@ -598,7 +782,9 @@ const heartbeatInterval = setInterval(() => {
 
         if (ws.isAlive === false) {
 
-            ws.terminate();
+            try {
+                ws.terminate();
+            } catch {}
 
             continue;
         }
@@ -608,7 +794,9 @@ const heartbeatInterval = setInterval(() => {
         try {
             ws.ping();
         } catch {
-            ws.terminate();
+            try {
+                ws.terminate();
+            } catch {}
         }
     }
 
@@ -620,7 +808,9 @@ const heartbeatInterval = setInterval(() => {
 
 function shutdown() {
 
-    clearInterval(heartbeatInterval);
+    clearInterval(
+        heartbeatInterval
+    );
 
     for (const ws of wss.clients) {
 
@@ -634,17 +824,37 @@ function shutdown() {
     });
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on(
+    "SIGTERM",
+    shutdown
+);
+
+process.on(
+    "SIGINT",
+    shutdown
+);
 
 //==========================================================
 // START
 //==========================================================
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
 
-    console.log(
-        `Roblox Chat Relay running on port ${PORT}`
-    );
+        console.log(
+            `ZERO CHAT Relay running on port ${PORT}`
+        );
 
-});
+        console.log(
+            "Supported client commands: " +
+            ";hl ;unhl ;title ;untitle ;staff ;unstaff"
+        );
+
+        console.log(
+            "Supported server commands: " +
+            ";ban ;announce ;gannounce ;globalannounce"
+        );
+    }
+);
